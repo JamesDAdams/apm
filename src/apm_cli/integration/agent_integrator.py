@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import frontmatter
 import yaml
 
 from apm_cli.install.primitive_classification import (
@@ -25,7 +26,7 @@ from apm_cli.utils.atomic_io import normalize_crlf_to_lf, write_text_lf
 from apm_cli.utils.diagnostics import printable_ascii_text
 from apm_cli.utils.path_security import PathTraversalError, ensure_path_within
 from apm_cli.utils.paths import portable_relpath
-from apm_cli.utils.yaml_io import load_yaml_str, yaml_to_str
+from apm_cli.utils.yaml_io import load_yaml_str, loads_frontmatter, yaml_to_str
 
 if TYPE_CHECKING:
     from apm_cli.integration.targets import TargetProfile
@@ -280,6 +281,13 @@ class AgentIntegrator(BaseIntegrator):
                     package_name=package_info.package.name,
                 )
                 links_resolved = 0
+            elif mapping.format_id == "openfox_agent":
+                links_resolved = self._write_openfox_agent(
+                    source_file,
+                    target_path,
+                    diagnostics=diagnostics,
+                    package_name=package_info.package.name,
+                )
             else:
                 if mapping.format_id == "opencode_agent":
                     self._warn_opencode_frontmatter(
@@ -360,6 +368,48 @@ class AgentIntegrator(BaseIntegrator):
             raise ValueError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
         content, links_resolved = self.resolve_links(content, source, target)
+        write_text_lf(target, content)
+        return links_resolved
+
+    def _write_openfox_agent(
+        self,
+        source: Path,
+        target: Path,
+        diagnostics: DiagnosticCollector | None = None,
+        package_name: str | None = None,
+    ) -> int:
+        """Write an OpenFox agent file ensuring required id in frontmatter."""
+        if source.is_symlink():
+            raise ValueError(f"Refusing to read symlink source: {source}")
+        content = source.read_text(encoding="utf-8")
+        content, links_resolved = self.resolve_links(content, source, target)
+
+        stem = source.name[:-9] if source.name.endswith(".agent.md") else source.stem
+        try:
+            post = loads_frontmatter(content)
+            metadata = getattr(post, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if not metadata.get("id"):
+                metadata["id"] = metadata.get("name") or stem
+            if "tools" in metadata and "allowedTools" not in metadata:
+                tools = metadata["tools"]
+                if isinstance(tools, list):
+                    metadata["allowedTools"] = [str(t) for t in tools]
+            post.metadata = metadata
+            content = frontmatter.dumps(post, sort_keys=False)
+        except Exception as exc:
+            if diagnostics is not None:
+                pkg_tag = f"{package_name}/" if package_name else ""
+                diagnostics.warn(
+                    message=(
+                        f"OpenFox agent {pkg_tag}{printable_ascii_text(source.name)}: "
+                        f"failed to parse frontmatter ({exc}); agent written without metadata normalization."
+                    ),
+                    package=printable_ascii_text(package_name or ""),
+                )
+        if not content.endswith("\n"):
+            content += "\n"
         write_text_lf(target, content)
         return links_resolved
 

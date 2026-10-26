@@ -58,6 +58,10 @@ _CROSS_TARGET_MAPS: dict[str, dict[str, str]] = {
         ".github/skills/": ".agents/skills/",
         ".github/agents/": ".opencode/agents/",
     },
+    "openfox": {
+        ".github/skills/": ".openfox/skills/",
+        ".github/agents/": ".openfox/agents/",
+    },
     "vscode": {
         ".claude/skills/": ".github/skills/",
         ".claude/agents/": ".github/agents/",
