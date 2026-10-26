@@ -268,3 +268,129 @@ class TestOpenFoxAgentIntegration:
 
         assert ".openfox" in PLACEMENT_HIDDEN_TOOL_TREES
         assert ".openfox" in _HOST_QUALIFIED_VIRTUAL_ROOTS
+
+    def test_openfox_bundle_cross_target_maps(self) -> None:
+        from apm_cli.bundle.lockfile_enrichment import _CROSS_TARGET_MAPS
+
+        mapping = _CROSS_TARGET_MAPS["openfox"]
+        assert mapping[".agents/skills/"] == ".openfox/skills/"
+        assert mapping[".github/skills/"] == ".openfox/skills/"
+        assert ".github/agents/" not in mapping
+
+    def test_openfox_tools_normalization_string_and_dict(self, tmp_path: Path) -> None:
+        from apm_cli.utils.diagnostics import DiagnosticCollector
+
+        (tmp_path / ".openfox").mkdir()
+        pkg_dir = tmp_path / "pkg"
+        pkg_dir.mkdir()
+        agent_dir = pkg_dir / ".apm" / "agents"
+        agent_dir.mkdir(parents=True)
+
+        # Agent with comma-separated tools string
+        (agent_dir / "str_tools.agent.md").write_text(
+            "---\ntools: 'read, write, bash'\n---\nPrompt.\n",
+            encoding="utf-8",
+        )
+        # Agent with boolean dictionary tools
+        (agent_dir / "dict_tools.agent.md").write_text(
+            "---\ntools:\n  read: true\n  write: false\n  bash: true\n  invalid: 42\n---\nPrompt.\n",
+            encoding="utf-8",
+        )
+        # Agent with unsupported tools type
+        (agent_dir / "bad_tools.agent.md").write_text(
+            "---\ntools: 12345\n---\nPrompt.\n",
+            encoding="utf-8",
+        )
+
+        diagnostics = DiagnosticCollector()
+        integrator = AgentIntegrator()
+        pkg_info = _make_package_info(pkg_dir)
+        integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["openfox"],
+            pkg_info,
+            tmp_path,
+            diagnostics=diagnostics,
+        )
+
+        # Verify str_tools
+        deployed_str = tmp_path / ".openfox" / "agents" / "str_tools.agent.md"
+        assert deployed_str.exists()
+        post_str = loads_frontmatter(deployed_str.read_text(encoding="utf-8"))
+        assert post_str.metadata["id"] == "str_tools"
+        assert post_str.metadata["allowedTools"] == ["read", "write", "bash"]
+
+        # Verify dict_tools
+        deployed_dict = tmp_path / ".openfox" / "agents" / "dict_tools.agent.md"
+        assert deployed_dict.exists()
+        post_dict = loads_frontmatter(deployed_dict.read_text(encoding="utf-8"))
+        assert post_dict.metadata["id"] == "dict_tools"
+        assert post_dict.metadata["allowedTools"] == ["read", "bash"]
+
+        # Verify bad_tools
+        deployed_bad = tmp_path / ".openfox" / "agents" / "bad_tools.agent.md"
+        assert deployed_bad.exists()
+        post_bad = loads_frontmatter(deployed_bad.read_text(encoding="utf-8"))
+        assert post_bad.metadata["id"] == "bad_tools"
+        assert "allowedTools" not in post_bad.metadata
+
+        # Verify diagnostics warnings
+        warnings = diagnostics.by_category().get("warning", [])
+        assert any("non-boolean value" in w.message and "invalid" in w.message for w in warnings)
+        assert any("unsupported 'tools' format" in w.message and "bad_tools" in w.message for w in warnings)
+
+    def test_openfox_agent_adoption_requires_normalized_content(self, tmp_path: Path) -> None:
+        (tmp_path / ".openfox").mkdir()
+        pkg_dir = tmp_path / "pkg"
+        pkg_dir.mkdir()
+        agent_dir = pkg_dir / ".apm" / "agents"
+        agent_dir.mkdir(parents=True)
+
+        raw_src = "---\nname: Test Agent\ntools:\n- read\n---\nBody content\n"
+        (agent_dir / "worker.agent.md").write_text(raw_src, encoding="utf-8")
+
+        openfox_agents = tmp_path / ".openfox" / "agents"
+        openfox_agents.mkdir(parents=True)
+        target_file = openfox_agents / "worker.agent.md"
+
+        # 1. Pre-place with RAW un-normalized source bytes (missing id, tools not allowedTools)
+        target_file.write_text(raw_src, encoding="utf-8")
+
+        integrator = AgentIntegrator()
+        pkg_info = _make_package_info(pkg_dir)
+
+        # Without force, it should collide / skip, NOT adopt
+        result = integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["openfox"],
+            pkg_info,
+            tmp_path,
+            managed_files=None,
+            force=False,
+        )
+        assert result.files_adopted == 0
+        assert result.files_skipped == 1
+
+        # With force, it overwrites and normalizes
+        result_force = integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["openfox"],
+            pkg_info,
+            tmp_path,
+            managed_files=None,
+            force=True,
+        )
+        assert result_force.files_adopted == 0
+        assert result_force.files_integrated == 1
+        post = loads_frontmatter(target_file.read_text(encoding="utf-8"))
+        assert post.metadata["id"] == "Test Agent"
+        assert post.metadata["allowedTools"] == ["read"]
+
+        # 2. Re-install when normalized content matches: should adopt
+        result_adopt = integrator.integrate_agents_for_target(
+            KNOWN_TARGETS["openfox"],
+            pkg_info,
+            tmp_path,
+            managed_files={".openfox/agents/worker.agent.md"},
+            force=False,
+        )
+        assert result_adopt.files_adopted == 1
+        assert result_adopt.files_integrated == 0
+

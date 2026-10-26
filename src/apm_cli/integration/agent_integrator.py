@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 import yaml
@@ -263,8 +263,27 @@ class AgentIntegrator(BaseIntegrator):
 
             rel_path = portable_relpath(target_path, project_root)
 
+            rendered_openfox_content: str | None = None
+            openfox_links_resolved = 0
+            expected_content: str | None = None
+            if mapping.format_id == "openfox_agent":
+                rendered_openfox_content, openfox_links_resolved = self.render_openfox_agent(
+                    source_file,
+                    target_path,
+                    diagnostics=diagnostics,
+                    package_name=package_info.package.name,
+                )
+                expected_content = rendered_openfox_content
+
             skip, adopted = self._check_adopt_or_skip(
-                target_path, source_file, rel_path, managed_files, force, diagnostics, target_paths
+                target_path,
+                source_file,
+                rel_path,
+                managed_files,
+                force,
+                diagnostics,
+                target_paths,
+                expected_content=expected_content,
             )
             if skip:
                 if adopted:
@@ -282,12 +301,9 @@ class AgentIntegrator(BaseIntegrator):
                 )
                 links_resolved = 0
             elif mapping.format_id == "openfox_agent":
-                links_resolved = self._write_openfox_agent(
-                    source_file,
-                    target_path,
-                    diagnostics=diagnostics,
-                    package_name=package_info.package.name,
-                )
+                if rendered_openfox_content is not None:
+                    write_text_lf(target_path, rendered_openfox_content)
+                links_resolved = openfox_links_resolved
             else:
                 if mapping.format_id == "opencode_agent":
                     self._warn_opencode_frontmatter(
@@ -371,14 +387,55 @@ class AgentIntegrator(BaseIntegrator):
         write_text_lf(target, content)
         return links_resolved
 
-    def _write_openfox_agent(
+    @staticmethod
+    def _normalize_openfox_tools(
+        tools: Any,
+        source_name: str,
+        diagnostics: DiagnosticCollector | None = None,
+        package_name: str | None = None,
+    ) -> list[str] | None:
+        """Convert tools (list, comma-separated str, or bool mapping) to allowedTools list."""
+        pkg_tag = f"{package_name}/" if package_name else ""
+        if tools is None:
+            return None
+        if isinstance(tools, list):
+            return [str(t).strip() for t in tools if str(t).strip()]
+        if isinstance(tools, str):
+            return [t.strip() for t in tools.split(",") if t.strip()]
+        if isinstance(tools, dict):
+            allowed: list[str] = []
+            for k, v in tools.items():
+                if isinstance(v, bool):
+                    if v:
+                        allowed.append(str(k).strip())
+                elif diagnostics is not None:
+                    diagnostics.warn(
+                        message=(
+                            f"OpenFox agent {pkg_tag}{printable_ascii_text(source_name)}: "
+                            f"mapping tool '{printable_ascii_text(str(k))}' has non-boolean value ({type(v).__name__}); "
+                            "omitted from allowedTools."
+                        ),
+                        package=printable_ascii_text(package_name or ""),
+                    )
+            return allowed
+        if diagnostics is not None:
+            diagnostics.warn(
+                message=(
+                    f"OpenFox agent {pkg_tag}{printable_ascii_text(source_name)}: "
+                    f"unsupported 'tools' format ({type(tools).__name__}); could not convert to allowedTools."
+                ),
+                package=printable_ascii_text(package_name or ""),
+            )
+        return None
+
+    def render_openfox_agent(
         self,
         source: Path,
         target: Path,
         diagnostics: DiagnosticCollector | None = None,
         package_name: str | None = None,
-    ) -> int:
-        """Write an OpenFox agent file ensuring required id in frontmatter."""
+    ) -> tuple[str, int]:
+        """Render OpenFox agent content ensuring required id and allowedTools in frontmatter."""
         if source.is_symlink():
             raise ValueError(f"Refusing to read symlink source: {source}")
         content = source.read_text(encoding="utf-8")
@@ -393,9 +450,14 @@ class AgentIntegrator(BaseIntegrator):
             if not metadata.get("id"):
                 metadata["id"] = metadata.get("name") or stem
             if "tools" in metadata and "allowedTools" not in metadata:
-                tools = metadata["tools"]
-                if isinstance(tools, list):
-                    metadata["allowedTools"] = [str(t) for t in tools]
+                converted = self._normalize_openfox_tools(
+                    metadata["tools"],
+                    source.name,
+                    diagnostics=diagnostics,
+                    package_name=package_name,
+                )
+                if converted is not None:
+                    metadata["allowedTools"] = converted
             post.metadata = metadata
             content = frontmatter.dumps(post, sort_keys=False)
         except Exception as exc:
@@ -410,6 +472,22 @@ class AgentIntegrator(BaseIntegrator):
                 )
         if not content.endswith("\n"):
             content += "\n"
+        return content, links_resolved
+
+    def _write_openfox_agent(
+        self,
+        source: Path,
+        target: Path,
+        diagnostics: DiagnosticCollector | None = None,
+        package_name: str | None = None,
+    ) -> int:
+        """Write an OpenFox agent file ensuring required id in frontmatter."""
+        content, links_resolved = self.render_openfox_agent(
+            source,
+            target,
+            diagnostics=diagnostics,
+            package_name=package_name,
+        )
         write_text_lf(target, content)
         return links_resolved
 
